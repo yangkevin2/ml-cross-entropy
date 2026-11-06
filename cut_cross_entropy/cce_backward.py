@@ -81,6 +81,7 @@ def _cce_backward_kernel(
     C,
     Bias,
     LSE,
+    OtherLSE,
     dOut,
     grad_scale,
     dLSE,
@@ -190,8 +191,10 @@ def _cce_backward_kernel(
     if HAS_VALIDS:
         direct_offs_b = (pid_b * BLOCK_B + tl.arange(0, BLOCK_B)).to(tl.int64)
         lse = tl.load(LSE + direct_offs_b, mask=direct_offs_b < B, other=float("inf"))
+        other_lse = tl.load(OtherLSE + direct_offs_b, mask=direct_offs_b < B, other=-float("inf"))
     else:
         lse = tl.load(LSE + offs_b, mask=offs_b < B, other=float("inf"))
+        other_lse = tl.load(OtherLSE + offs_b, mask=offs_b < B, other=-float("inf"))
 
     accum = accum.cast(tl.float32)
     d_accum = tl.exp(accum - lse[:, None])
@@ -205,7 +208,7 @@ def _cce_backward_kernel(
 
         targets = tl.load(Targets + target_offs_b, mask=target_offs_b < BMax, other=V + 1)
         is_target = targets[:, None] == offs_v[None, :]
-        d_accum += tl.where(is_target, -1.0, 0.0)
+        d_accum = tl.where(is_target, -tl.exp(other_lse[:, None] - lse[:, None]), d_accum)
     else:
         is_target = None
 
@@ -354,6 +357,7 @@ def cce_backward_kernel(
     bias: torch.Tensor | None,
     bias_info: TensorInfo | None,
     lse: torch.Tensor,
+    other_lse: torch.Tensor,
     valids: torch.Tensor | None,
     softcap: float | None,
     filter_eps: float | None,
@@ -473,6 +477,7 @@ def cce_backward_kernel(
         c,
         bias,
         lse,
+        other_lse,
         do,
         grad_scale,
         dlse,

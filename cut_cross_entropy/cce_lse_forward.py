@@ -14,6 +14,7 @@ def _cce_lse_forward_kernel(
     C,
     Bias,
     LSE,
+    OtherLSE,
     LA,
     NegCorrectLogit,
     Locks,
@@ -123,6 +124,17 @@ def _cce_lse_forward_kernel(
     this_mx = tl.max(logits, axis=1)
     this_lse = this_mx + tl.log(tl.sum(tl.exp(logits - this_mx[:, None]), axis=1))
 
+    if HAS_TARGETS:
+        other_logits = tl.where(this_targets[:, None] == offs_v[None, :], -float("inf"), logits)
+        other_mx = tl.max(other_logits, axis=1)
+        other_shifted = tl.where(
+            other_logits > -float("inf"),
+            other_logits - other_mx[:, None],
+            -float("inf"),
+        )
+        other_sum = tl.sum(tl.exp(other_shifted), axis=1)
+        this_other_lse = tl.where(other_sum > 0, other_mx + tl.log(other_sum), -float("inf"))
+
     o_mask = offs_b < B
 
     lse_ptrs = LSE + offs_b
@@ -134,6 +146,20 @@ def _cce_lse_forward_kernel(
     lse = tl.load(lse_ptrs, mask=o_mask, other=0.0, eviction_policy="evict_last")
     lse = tl_logaddexp(lse, this_lse)
     lse = tl.store(lse_ptrs, lse, mask=o_mask, eviction_policy="evict_last")
+
+    if HAS_TARGETS:
+        other_lse_ptrs = OtherLSE + offs_b
+        other_lse = tl.load(other_lse_ptrs, mask=o_mask, other=-float("inf"), eviction_policy="evict_last")
+        other_lse = tl.where(
+            this_other_lse == -float("inf"),
+            other_lse,
+            tl.where(
+                other_lse == -float("inf"),
+                this_other_lse,
+                tl_logaddexp(other_lse, this_other_lse),
+            ),
+        )
+        tl.store(other_lse_ptrs, other_lse, mask=o_mask, eviction_policy="evict_last")
 
     tl.debug_barrier()
     tl.atomic_xchg(this_locks, 0)
@@ -161,6 +187,7 @@ _cce_lse_forward_kernel = cce_forward_autotune()(_cce_lse_forward_kernel)  # typ
 @dataclass(slots=True)
 class LSEReturn:
     lse: torch.Tensor
+    other_lse: torch.Tensor | None
     logit_avg: torch.Tensor | None
     neg_correct_logit: torch.Tensor | None
 
@@ -191,6 +218,7 @@ def cce_lse_forward_kernel(
     V, D = c.shape
     # Allocates output.
     lse = e.new_full((B,), -torch.inf, dtype=torch.float32)
+    other_lse = e.new_full((B,), -torch.inf, dtype=torch.float32) if targets is not None else None
     neg_correct_logit = e.new_full((B,), 0.0, dtype=torch.float32) if targets is not None else None
     assert lse.stride(0) == 1
 
@@ -214,6 +242,7 @@ def cce_lse_forward_kernel(
         c,
         bias,
         lse,
+        other_lse,
         logit_avg,
         neg_correct_logit,
         locks,
@@ -235,4 +264,4 @@ def cce_lse_forward_kernel(
         B_BIN=b_bin_fn(B),
     )
 
-    return LSEReturn(lse, logit_avg, neg_correct_logit)
+    return LSEReturn(lse, other_lse, logit_avg, neg_correct_logit)

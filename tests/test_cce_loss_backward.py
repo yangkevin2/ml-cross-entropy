@@ -540,3 +540,27 @@ def test_gradient_divergence():
     z_diff_avg = z_diff_sum / loss_diff_count if loss_diff_count > 0 else 0.0
     print(f"CE Diff Avg (abs): {ce_diff_avg:.8f}")
     print(f"Z Diff Avg (abs):  {z_diff_avg:.8f}")
+
+
+@skip_no_cuda
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("softcap", [None, 30.0])
+def test_high_confidence_loss_and_gradients(dtype: torch.dtype, softcap: float | None):
+    targets = torch.tensor([0, 2048, 4095], device="cuda")
+    e = torch.eye(3, device="cuda", dtype=dtype).requires_grad_()
+    c = torch.zeros((4096, 3), device="cuda", dtype=dtype)
+    c[targets, torch.arange(3, device="cuda")] = 20.0
+    c.requires_grad_()
+    loss = linear_cross_entropy(e, c, targets, impl="cce_exact", softcap=softcap)
+    reference_e = e.detach().double().requires_grad_()
+    reference_c = c.detach().double().requires_grad_()
+    logits = reference_e @ reference_c.T
+    if softcap is not None:
+        logits = torch.tanh(logits / softcap) * softcap
+    reference = torch.nn.functional.cross_entropy(logits, targets)
+    loss.backward()
+    reference.backward()
+    torch.testing.assert_close(loss.double(), reference, atol=0, rtol=0.01)
+    assert e.grad is not None and c.grad is not None
+    torch.testing.assert_close(e.grad.double(), reference_e.grad, atol=1e-12, rtol=0.01)
+    torch.testing.assert_close(c.grad.double(), reference_c.grad, atol=1e-12, rtol=0.01)

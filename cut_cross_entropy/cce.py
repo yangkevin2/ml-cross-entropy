@@ -104,20 +104,24 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
             targets=targets,
         )
         lse = ret.lse
+        other_lse = ret.other_lse
         assert ret.neg_correct_logit is not None
         neg_correct_logit = ret.neg_correct_logit
         logit_avg = ret.logit_avg
 
         if params.vocab_parallel_options is not None:
             lse = vp_reduce_lse(lse, pg=params.vocab_parallel_options.group)
+            assert other_lse is not None
+            other_lse = vp_reduce_lse(other_lse, pg=params.vocab_parallel_options.group)
 
             neg_correct_logit = vp_reduce_correct_logit(
                 neg_correct_logit, pg=params.vocab_parallel_options.group, dtype=lse.dtype
             )
 
-        nll = neg_correct_logit.add_(lse)
+        assert other_lse is not None
+        nll = torch.nn.functional.softplus(other_lse + neg_correct_logit)
 
-        ctx.save_for_backward(e, c, bias, lse, params.targets, params.valids, logit_avg)
+        ctx.save_for_backward(e, c, bias, lse, other_lse, params.targets, params.valids, logit_avg)
         ctx.params = params
         ctx.e_info = e_info
         ctx.c_info = c_info
@@ -145,7 +149,7 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
     def backward(
         ctx, grad_out: torch.Tensor, grad_lse_out: torch.Tensor | None
     ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, None]:
-        e, c, bias, lse, targets, valids, logit_avg = ctx.saved_tensors
+        e, c, bias, lse, other_lse, targets, valids, logit_avg = ctx.saved_tensors
 
         if logit_avg is not None:
             vocab_ordering = sort_logit_avg(logit_avg)
@@ -196,6 +200,7 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
             bias=bias,
             bias_info=ctx.bias_info,
             lse=lse,
+            other_lse=other_lse,
             valids=valids,
             softcap=params.softcap,
             filter_eps=params.filter_eps,
